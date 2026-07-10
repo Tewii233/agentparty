@@ -5,8 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildHostBoard, type MsgFrame, type PresenceEntry } from "@agentparty/shared";
 import { workspaceId } from "../src/config";
-import { handleRestError, RestError, TAIL_BEFORE } from "../src/rest";
-import { startRestMock, type RestMock, type RestRequest } from "./rest-mock";
+import { handleRestError, RestError } from "../src/rest";
+import { messagesRoute, startRestMock, type RestMock, type RestRequest } from "./rest-mock";
 
 const indexPath = join(import.meta.dir, "..", "src", "index.ts");
 
@@ -964,16 +964,48 @@ describe("party status/history channel flag", () => {
     expect(frame.recommended_actions).toEqual([
       expect.objectContaining({ kind: "review-blockers", target: "worker-b", requires_human: false }),
     ]);
-    // #151 扩展：host board 默认取最近窗口（tail），不再是「取头 500 条」——否则频道超过
-    // limit 条后 last_seq 永久冻结、loop guard blocker 永远看不到最新发言。
-    // 消息端点这里被打两次：主窗口查询 + limit=1 的头探针（拿真实 head 供窗口显式化用），
-    // 用 limit 区分，不依赖并发到达顺序。
-    const messageReqs = reqsOf(mock, "GET", "/api/channels/dev/messages");
-    const mainReq = messageReqs.find((r) => r.query.limit !== "1");
-    expect(mainReq?.query).toMatchObject({ before: String(TAIL_BEFORE), limit: "500" });
-    expect(mainReq?.query.since).toBeUndefined();
-    const headProbeReq = messageReqs.find((r) => r.query.limit === "1");
-    expect(headProbeReq?.query.before).toBe(String(TAIL_BEFORE));
+    // #151 扩展：host board 默认取最近窗口（tail）。这条测试聚焦 board 内容本身（hosts/
+    // open_claims/blockers/decisions），「窗口是否落在尾部」的语义单独用合成 seq 1..N 消息流
+    // 验证，见下面「host board 默认走最近窗口——last_seq/window 落在尾部」这条。这里不再断言
+    // 请求 query string 长什么样：那是实现细节，换一个语义等价的哨兵实现（例如把
+    // before=MAX_SAFE_INTEGER 换成「先探 head 再 before=head+1」）语义完全不变，
+    // 断言 query string 就会把这条测试无辜带红（见频道公告 seq 374）。
+  });
+
+  test("host board 默认走最近窗口——last_seq/window 落在尾部", async () => {
+    // 合成 seq 1..12 的消息流，N 明显大于 --limit 5：断言读回来的 last_seq/window 落在尾部
+    // （8..12），而不是断言请求长什么样——换一个语义等价的哨兵实现，这条也不能变红。
+    const allMessages = Array.from({ length: 12 }, (_, i) => ({
+      type: "msg",
+      seq: i + 1,
+      sender: { name: "alice", kind: "agent" },
+      kind: "message",
+      body: `m${i + 1}`,
+      mentions: [],
+      reply_to: null,
+      state: null,
+      note: null,
+      status: null,
+      ts: (i + 1) * 1000,
+    }));
+    mock = startRestMock((req) => {
+      if (req.method === "GET" && req.path === "/api/channels/dev/presence") {
+        return Response.json({ presence: [] });
+      }
+      return messagesRoute(allMessages)(req);
+    });
+    writeCfg(mock.url);
+    const r = await runCli(["host", "board", "dev", "--limit", "5", "--json"]);
+    expect(r.code).toBe(0);
+    const frame = JSON.parse(r.stdout.trim()) as {
+      last_seq: number;
+      window: { from: number; to: number; head: number; truncated: boolean };
+    };
+    expect(frame.last_seq).toBe(12);
+    expect(frame.window.from).toBe(8);
+    expect(frame.window.to).toBe(12);
+    expect(frame.window.head).toBe(12);
+    expect(frame.window.truncated).toBe(false);
   });
 
   test("host board recommends human guard reset and takeover when only stale hosts remain", async () => {

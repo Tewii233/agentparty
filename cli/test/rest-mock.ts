@@ -282,3 +282,36 @@ export function startRestMock(handler?: RestHandler): RestMock {
     },
   };
 }
+
+/**
+ * 按服务端真实语义（worker/src/do.ts `/internal/messages`）为合成消息流分页：
+ * - before > 0 → 取 seq < before 的最后 limit 条（服务端 ORDER BY seq DESC LIMIT，再按 seq 升序输出）
+ * - 否则       → 取 seq > since 的前 limit 条（升序）
+ * 调用方传入的 all 必须已按 seq 升序排列。
+ *
+ * 命令级测试用它喂一条完整的 seq 序列，让 mock 按真实分页规则回复，从而可以断言命令输出里
+ * 出现的 seq 落在哪个区间（语义），而不是断言请求 query string 长什么样（形状）——后者是
+ * 实现细节，换一个语义等价的哨兵实现（例如把 before=MAX_SAFE_INTEGER 换成「先探 head 再
+ * before=head+1」）就会把这类断言无辜带红。
+ */
+export function paginateMessages<T extends { seq: number }>(all: T[], q: Record<string, string>): T[] {
+  const before = Number(q.before ?? "0");
+  const since = Number(q.since ?? "0");
+  const rawLimit = Number(q.limit ?? "100");
+  const limit = Math.min(Math.max(Number.isFinite(rawLimit) ? rawLimit : 100, 1), 1000);
+  if (Number.isFinite(before) && before > 0) {
+    return all.filter((m) => m.seq < before).slice(-limit);
+  }
+  const sinceValue = Number.isFinite(since) ? since : 0;
+  return all.filter((m) => m.seq > sinceValue).slice(0, limit);
+}
+
+/** RestHandler 工厂：GET /api/channels/:slug/messages 按 paginateMessages 的真实分页语义回复。 */
+export function messagesRoute(allMessages: { seq: number }[]): RestHandler {
+  return (req: RestRequest) => {
+    if (req.method === "GET" && /^\/api\/channels\/[^/]+\/messages$/.test(req.path)) {
+      return Response.json({ messages: paginateMessages(allMessages, req.query) });
+    }
+    return undefined;
+  };
+}

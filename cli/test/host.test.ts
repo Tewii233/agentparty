@@ -1,11 +1,14 @@
 // party host board（#151 扩展）：默认必须走 tail（最近窗口），并显式打印窗口范围与截断告警。
-// 断言查询串本身与纯函数输出（过程），不只看命令返回码——见频道公告 rev347 契约①。
+// 断言语义（读回来的 last_seq/window 落在尾部还是头部）与纯函数输出，不只看命令返回码——
+// 不断言请求 query string 长什么样：那是实现细节，换一个语义等价的哨兵实现（例如把
+// before=MAX_SAFE_INTEGER 换成「先探 head 再 before=head+1」）语义不变，断言 query string
+// 就会把测试无辜带红（见频道公告 seq 374，契约①）。
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type BoardWindow, describeWindow, formatWindowLines, run } from "../src/commands/host";
-import { TAIL_BEFORE } from "../src/rest";
+import { paginateMessages } from "./rest-mock";
 
 let home: string;
 let oldHome: string | undefined;
@@ -39,7 +42,8 @@ afterEach(() => {
 });
 
 // host board 一次并发发三个请求（presence + 主查询 + limit=1 的头探针）。
-// 全局变量拦截 fetch 在并发下会被互相覆盖，必须起一个真实的本地 server 按路径/查询串分别记录。
+// 全局变量拦截 fetch 在并发下会被互相覆盖，必须起一个真实的本地 server；按真实分页语义
+// （paginateMessages）回复，这样才能断言「读回来的 seq 落在哪个区间」而不是请求长什么样。
 function startMockServer(messages: { seq: number }[]): { seen: string[] } {
   const seen: string[] = [];
   restServer = Bun.serve({
@@ -52,9 +56,8 @@ function startMockServer(messages: { seq: number }[]): { seen: string[] } {
       }
       if (url.pathname.endsWith("/messages")) {
         seen.push(url.search);
-        // 头探针恒 limit=1，只回最新一条；其余按传入的 messages 原样返回
-        const isHeadProbe = url.searchParams.get("limit") === "1";
-        return Response.json({ messages: isHeadProbe ? messages.slice(-1) : messages });
+        const q = Object.fromEntries(url.searchParams.entries());
+        return Response.json({ messages: paginateMessages(messages, q) });
       }
       return Response.json({ error: { code: "not_found", message: "not found" } }, { status: 404 });
     },
@@ -66,36 +69,33 @@ function startMockServer(messages: { seq: number }[]): { seen: string[] } {
   return { seen };
 }
 
-function isHeadProbeSearch(search: string): boolean {
-  return new URLSearchParams(search).get("limit") === "1";
-}
-
 describe("party host board 默认取尾（#151 扩展）", () => {
-  test("默认（无 --since）→ 主查询与头探针都带 before=TAIL_BEFORE，不带 since=", async () => {
-    const { seen } = startMockServer([]);
-    const code = await run(["board", "dev"]);
+  test("默认（无 --since）→ last_seq/window 落在尾部", async () => {
+    // 合成 seq 1..12，--limit 5：断言读回来的窗口是尾部（8..12），不断言请求长什么样。
+    const messages = Array.from({ length: 12 }, (_, i) => ({ seq: i + 1 }));
+    startMockServer(messages);
+    const code = await run(["board", "dev", "--limit", "5", "--json"]);
     expect(code).toBe(0);
-    expect(seen.length).toBeGreaterThanOrEqual(2);
-    for (const search of seen) {
-      expect(search).toContain(`before=${TAIL_BEFORE}`);
-      expect(search).not.toContain("since=");
-    }
+    const frame = JSON.parse(stdout[0]!) as { last_seq: number; window: BoardWindow };
+    expect(frame.last_seq).toBe(12);
+    expect(frame.window.from).toBe(8);
+    expect(frame.window.to).toBe(12);
+    expect(frame.window.head).toBe(12);
+    expect(frame.window.truncated).toBe(false);
   });
 
-  test("显式 --since 0 → 主查询带 since=0、不带 before=（头探针仍单独走 tail）", async () => {
-    const { seen } = startMockServer([]);
-    const code = await run(["board", "dev", "--since", "0"]);
+  test("显式 --since 0 → last_seq/window 落在头部，但 head 仍是真实尾部", async () => {
+    const messages = Array.from({ length: 12 }, (_, i) => ({ seq: i + 1 }));
+    startMockServer(messages);
+    const code = await run(["board", "dev", "--since", "0", "--limit", "5", "--json"]);
     expect(code).toBe(0);
-    const mainCalls = seen.filter((s) => !isHeadProbeSearch(s));
-    expect(mainCalls.length).toBeGreaterThan(0);
-    for (const search of mainCalls) {
-      expect(search).toContain("since=0");
-      expect(search).not.toContain("before=");
-    }
-    // 头探针必须仍然存在且走 tail，否则算不出真实 head
-    const headCalls = seen.filter(isHeadProbeSearch);
-    expect(headCalls.length).toBeGreaterThan(0);
-    expect(headCalls[0]).toContain(`before=${TAIL_BEFORE}`);
+    const frame = JSON.parse(stdout[0]!) as { last_seq: number; window: BoardWindow };
+    expect(frame.last_seq).toBe(5);
+    expect(frame.window.from).toBe(1);
+    expect(frame.window.to).toBe(5);
+    // 头探针必须仍然存在且单独走 tail，否则算不出真实 head（不是本次窗口自己的 to）
+    expect(frame.window.head).toBe(12);
+    expect(frame.window.truncated).toBe(true);
   });
 });
 
