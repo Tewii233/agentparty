@@ -6,6 +6,9 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
+
+_MOCKDIR = tempfile.mkdtemp()  # mock 脚本写这里，不污染源目录
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -129,15 +132,14 @@ print("[集成: 坏输入 / mock 401 → 立即放行]")
 p = subprocess.run([sys.executable, os.path.join(HERE, "dispatcher.py")], input="{bad",
                    capture_output=True, text=True, env={**os.environ, "SPIKE_STATE_DIR": "/tmp", "SPIKE_TRACE_PATH": "/tmp/_t.jsonl"})
 ok(p.stdout.strip() == "{}" and "bad hook input" in p.stderr, "坏输入→{} + 响亮")
-mock = os.path.join(HERE, "_mock_party.sh")
+mock = os.path.join(_MOCKDIR, "_mock_party.sh")
 open(mock, "w").write('#!/bin/sh\necho "unauthorized" >&2\nexit 3\n'); os.chmod(mock, 0o755)
 p = subprocess.run([sys.executable, os.path.join(HERE, "dispatcher.py")], input=json.dumps(stop(sid="S")),
                    capture_output=True, text=True, env={**os.environ, "SPIKE_STATE_DIR": "/tmp", "SPIKE_TRACE_PATH": "/tmp/_t2.jsonl", "SPIKE_PARTY_BIN": mock})
 ok(p.stdout.strip() == "{}" and "RELEASE" in p.stderr, "party 401 → 立即放行+响亮(端到端)")
 # poll_ap 不合成 delivery_id（#1744.3）：history 消息无 delivery_id → RELEASE、不 claim（端到端）
-import tempfile  # noqa: E402
 sd = tempfile.mkdtemp()
-mock2 = os.path.join(HERE, "_mock_party_nodid.sh")
+mock2 = os.path.join(sd, "_mock_party_nodid.sh")
 open(mock2, "w").write('#!/bin/sh\ncat <<\'EOF\'\n{"seq":701,"kind":"message","sender":{"name":"x"},"mentions":["Evan_Clauder"],"body":"hi"}\nEOF\n')
 os.chmod(mock2, 0o755)
 p = subprocess.run([sys.executable, os.path.join(HERE, "dispatcher.py")], input=json.dumps(stop(sid="S")),
