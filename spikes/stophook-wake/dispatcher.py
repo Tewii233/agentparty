@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""AgentParty Stop-hook 唤醒 spike —— v3 隔离骨架（不接活会话）。
+"""AgentParty Stop-hook 唤醒 spike —— v4 隔离骨架（不接活会话）。
 
-v3 收紧 macmini 三审的接-真-delivery 硬门槛：
+v4 收紧 macmini 三/四审的接-真-delivery 硬门槛：
   A. claim 加 lease + nonce：pending 带 lease_expires_at 与 nonce；lease 内幂等去重、
-     lease 到期允许重 claim（崩溃/超时可重投）。
-  B. delivery_id 强校验：无有效(非空 str) delivery_id → 响亮 RELEASE，不 claim；
-     不把 seq 当稳定全局唯一 delivery identity（协议没保证）。IO 层为 spike 近似合成
-     显式标注、真 party watch 应给权威 delivery_id。
+     lease 到期允许重 claim（崩溃/超时可重投）。活 pending 排他：lease 未到期遇【不同】
+     delivery 一律 RELEASE、不覆盖，不丢原 claim/nonce。
+  B. delivery_id 强校验：无有效(非空 str) delivery_id → 响亮 RELEASE，不 claim；不把 seq
+     当稳定全局唯一 delivery identity。**poll_ap 不合成 delivery_id**——无权威 id 透传 None →
+     decide RELEASE（history-only 按设计不 claim；只有真 party watch/directed-delivery 给权威 id 才 claim）。
   C. SessionStart 不再无条件丢 pending：lease 未到期则保留（避免 lease 内重复 claim），
      到期才 abandon。
   D. build_reason 不可逃逸边界：正文 JSON 字符串编码（`>>>`/换行等被转义成文本）+ 每轮

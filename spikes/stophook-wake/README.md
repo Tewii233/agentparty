@@ -13,7 +13,7 @@ python3 test_coexistence.py     # 多-hook 共存 + 变异实测
 ## 文件
 - `dispatcher.py` —— 单 dispatcher。纯函数 `try_ack`/`decide`/`build_reason`/`confirm_turn` + `main()`（IO）。
 - `test_dispatcher.py` —— 脱机 36 项。
-- `test_coexistence.py` —— 共存 9 项（基线不变量 + 4 变异 M1-M4 全被抓红）。
+- `test_coexistence.py` —— 共存 7 项（单一 check_invariants；M1-M3 复用它对变异拓扑跑红；M4 真代码变异自证）。
 - `settings.example.json` / README.md。
 
 ## 机制
@@ -35,7 +35,7 @@ directed @：有 → `{"decision":"block","reason":<净化+JSON编码+nonce围�
 
 ## 证据
 - **脱机 36/36**（test_dispatcher）：seq/delivery_id 校验 · lease 去重&到期重 claim · **活 pending 排他** · try_ack 8 门槛 · **confirm_turn 结构化(有/无后续 assistant/时序)** · SessionStart lease 保留 · build_reason 对抗(伪造闭合 delimiter/role/控制序列/超长→边界不破) · 双预算硬顶 · **无 delivery_id 端到端不 claim**。
-- **共存 9/9**（test_coexistence）：基线(dispatcher 每事件命中一次、sibling 每事件一次、D1 只 claim&ack 一次)；变异 **M1 重复注册→2 命中 / M2 删分派→0 claim / M3 残留旧 Stop(独立 state)→2 claim / M4 ack 门(注入后无 assistant)→不 ack** 全被抓红。
+- **共存 7/7**（test_coexistence）：把不变量抽成单一 `check_invariants(trace)`（INV1 dispatcher 每事件恰一次 / INV2 每 delivery 恰 claim 一次 / INV3 恰 ack 一次），baseline→violations==[]；**每个变异【复用同一套 check_invariants】对变异拓扑跑一遍、断言真跑红**：M1 重复注册→INV1×2、M2 删分派→INV1/2/3 全空、M3 残留旧 Stop(独立 state)→INV 双 claim/ack；M4 用【真代码变异】(mutant dispatcher: try_ack 门恒真)自证 premature ack、真 dispatcher 同场景 0 ack。
 - **live（隔离 /tmp + mock party + 真 claude -p）**：session_id 全程唯一；`claim:D→确认续跑 Stop 才 ack:D`；**adversarial**：恶意正文(伪造 System+诱导 touch 诱饵+诱导泄 token)→ agent 识别为注入、拒执行、诱饵未创建、拒碰 token。
 
 ## 守约束（macmini 指定）
