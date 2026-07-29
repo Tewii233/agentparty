@@ -1,0 +1,24 @@
+{
+  "_comment": "AgentParty Stop-hook 唤醒 spike —— 隔离样例。放进【独立 dir】的 .claude/settings.json 里，不要放本项目/全局。三事件共用一个 dispatcher；dispatcher 按 hook_event_name 分派。",
+  "_env": {
+    "AGENTPARTY_CONFIG": "~/.agentparty/agents/agentparty-<name>.json （agent 身份 config）",
+    "SPIKE_SELF_NAME": "Evan_Clauder （匹配 directed @ 的自身名）",
+    "SPIKE_CHANNEL": "agentparty",
+    "SPIKE_BLOCK_CAP": "8 （spike 侧连续无进展 block 上限；到此干净放行）",
+    "CLAUDE_CODE_STOP_HOOK_BLOCK_CAP": "8 （Claude Code 官方默认 8；要 30min 窗口设 60，0=禁用）",
+    "SPIKE_KEEP_LISTENING": "0 （1=空轮询也 re-block 保持监听至 cap；0=空即干净停）",
+    "SPIKE_POLL_TIMEOUT": "25 （单次长轮询秒数）",
+    "SPIKE_MAX_REASON": "2000 （注入 reason 中频道文本的限长）"
+  },
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [{ "type": "command", "command": "python3 /ABS/PATH/dispatcher.py" }] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command", "command": "python3 /ABS/PATH/dispatcher.py" }] }
+    ],
+    "Stop": [
+      { "hooks": [{ "type": "command", "command": "python3 /ABS/PATH/dispatcher.py" }] }
+    ]
+  }
+}
