@@ -175,10 +175,13 @@ def decide(event: dict, poll: dict, state: dict, cfg: dict, now: float, nonce: s
         if seq is None:
             return R(RELEASE, {}, warn="[stophook] RELEASE: message has no valid positive-int seq", outcome="release:bad_seq")
         pending = st.get("pending")
-        # A: lease 内同 delivery 去重；lease 到期则视为无 pending、允许重 claim
-        if pending and pending.get("delivery_id") == did and _lease_alive(pending, now):
-            return R(RELEASE, {}, outcome=f"release:dedup_pending:{did}")
-        # claim：带 lease + nonce；不推进 authoritative cursor（ack 在确认续跑的 Stop）
+        # 活 pending 排他（macmini #1744.2）：lease 未到期时，同 delivery 去重、不同 delivery 也
+        # 【不抢占】——放行等原 pending ack 或 lease 到期，绝不覆盖、绝不丢失原 claim/nonce。
+        if _lease_alive(pending, now):
+            if pending.get("delivery_id") == did:
+                return R(RELEASE, {}, outcome=f"release:dedup_pending:{did}")
+            return R(RELEASE, {}, warn=f"[stophook] RELEASE: live pending {pending.get('delivery_id')} unresolved; not overwriting", outcome=f"release:pending_busy:{did}")
+        # 无活 pending（或 lease 到期）→ claim：带 lease + nonce；不推进 cursor（ack 在确认续跑的 Stop）
         st["pending"] = {"delivery_id": did, "seq": seq, "session_id": st.get("session_id"),
                          "injected_at": now, "lease_expires_at": now + cfg["lease_sec"], "nonce": nonce}
         st["block_count"] = st.get("block_count", 0) + 1
@@ -244,16 +247,49 @@ def _trace(event, outcome, delivery_id, acked_id):
         pass
 
 
+def _rec_role(rec):
+    if not isinstance(rec, dict):
+        return None
+    return rec.get("type") or (rec.get("message") or {}).get("role") or rec.get("role")
+
+
+def confirm_turn(lines, nonce) -> bool:
+    """结构化确认（macmini #1744.1）：nonce 只出现在我们注入的 reason（作为一条 user 记录）里；
+    要证明"注入轮真续跑"，必须在【含该 nonce 的 user 记录】之后存在 ≥1 条 assistant 记录。
+    仅"transcript 里出现过 nonce"不算数（那只是我们自己注入的、不能证明 agent 回了一轮）。纯函数。"""
+    if not nonce:
+        return False
+    marker = f"AP_INBOX:{nonce}"
+    parsed = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            parsed.append(json.loads(line))
+        except Exception:
+            parsed.append(None)
+    injected_idx = None
+    for i, rec in enumerate(parsed):
+        if _rec_role(rec) == "user" and marker in json.dumps(rec, ensure_ascii=False):
+            injected_idx = i  # 取最后一次注入
+    if injected_idx is None:
+        return False
+    for rec in parsed[injected_idx + 1:]:
+        if _rec_role(rec) == "assistant":
+            return True
+    return False
+
+
 def turn_confirmed_from_transcript(event, nonce_expected) -> bool:
-    """F: 读 Claude Code 提供的 transcript，确认注入的 nonce 真的作为一轮 user 消息进过会话
-    （证明上一轮 block 确实续跑了），而不仅是"同 session 下次 active Stop"。缺 transcript/nonce
-    → 保守返回 False（不 ack，交给 lease 治理重投）。"""
+    """IO 包装：读 Claude Code 提供的 transcript（JSONL）→ confirm_turn。缺 transcript/nonce/
+    异常 → 保守 False（不 ack，交给 lease 治理重投）。"""
     tp = event.get("transcript_path")
     if not tp or not nonce_expected:
         return False
     try:
         with open(os.path.expanduser(tp)) as f:
-            return f"AP_INBOX:{nonce_expected}" in f.read()
+            return confirm_turn(f.read().splitlines(), nonce_expected)
     except Exception:
         return False
 
@@ -283,11 +319,11 @@ def poll_ap(cursor: int, cfg: dict) -> dict:
             continue
         seq = valid_seq(m.get("seq"))
         if seq is not None and cfg["me"] in (m.get("mentions") or []) and seq > cursor:
-            # 真 party watch/directed-delivery 会给权威 delivery_id；history 近似时用 spike 前缀合成、
-            # 显式标注（不是把 seq 当 identity——decide 只信非空 str delivery_id）。
-            did = valid_delivery_id(m.get("delivery_id")) or f"spike-history:{cfg['channel']}:{seq}"
+            # 不合成 delivery_id（macmini #1744.3）：无权威 delivery_id → 透传 None，decide 会 RELEASE
+            # （硬门槛真触发）。history-only（无 directed-delivery）按设计【不 claim】；只有真 party
+            # watch / directed-delivery 给权威 delivery_id 才 claim。
             return {"status": "message", "message": {"seq": seq, "sender": s.get("name"),
-                    "text": m.get("body", ""), "delivery_id": did}}
+                    "text": m.get("body", ""), "delivery_id": valid_delivery_id(m.get("delivery_id"))}}
     return {"status": "empty"}
 
 

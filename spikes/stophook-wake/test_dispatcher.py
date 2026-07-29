@@ -9,7 +9,7 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from dispatcher import decide, try_ack, build_reason, strip_terminal_controls, valid_seq, valid_delivery_id  # noqa: E402
+from dispatcher import decide, try_ack, build_reason, strip_terminal_controls, valid_seq, valid_delivery_id, confirm_turn  # noqa: E402
 
 CFG = {"no_progress_cap": 8, "hard_total_cap": 30, "hard_deadline_sec": 1800,
        "lease_sec": 120, "keep_listening": False, "max_reason": 200}
@@ -62,6 +62,20 @@ ok(d2["action"] == "release" and "dedup" in d2["outcome"], "lease 内同 deliver
 d3 = decide(stop(active=True), msg(), pend, CFG, T0 + 200, "NONCE2")
 ok(d3["action"] == "block" and d3["state"]["pending"]["nonce"] == "NONCE2" and d3["state"]["pending"]["lease_expires_at"] == T0 + 200 + 120,
    "lease 到期 → 重 claim(新 nonce/lease)")
+# 活 pending 排他（#1744.2）：活 pending 期间来【不同】delivery → 不抢占、不覆盖，放行
+busy = decide(stop(active=True), msg(seq=99, did="D99"), pend, CFG, T0 + 10, "NONCE3")
+ok(busy["action"] == "release" and "pending_busy" in busy["outcome"] and busy["state"]["pending"]["delivery_id"] == "D11" and busy["state"]["pending"]["nonce"] == N,
+   "活 pending 期间来不同 delivery → RELEASE、原 D11 claim/nonce 不丢")
+
+print("[F2: confirm_turn 结构化确认(非仅搜到 nonce)]")
+def L(*recs): return [json.dumps(r) for r in recs]
+inj_user = {"type": "user", "message": {"role": "user", "content": "…<<<AP_INBOX:NX\n{}\nAP_INBOX:NX>>>"}}
+asst = {"type": "assistant", "message": {"role": "assistant", "content": "ok"}}
+ok(confirm_turn(L(inj_user, asst), "NX") is True, "含 nonce 的 user 记录后有 assistant → 确认续跑")
+ok(confirm_turn(L(inj_user), "NX") is False, "含 nonce 的 user 后【无】assistant → 不确认(仅注入不算续跑)")
+ok(confirm_turn(L(asst, inj_user), "NX") is False, "assistant 在注入【之前】→ 不确认(时序)")
+ok(confirm_turn(L({"type": "user", "message": {"content": "no marker"}}, asst), "NX") is False, "无 nonce → 不确认")
+ok(confirm_turn(L({"type": "system", "message": {"content": "AP_INBOX:NX>>>"}}, asst), "NX") is False, "nonce 只在非 user 记录 → 不确认")
 
 print("[F: try_ack 硬门槛(全过才 ack)]")
 claimed = decide(stop(), msg(seq=11, did="D11"), base_state(cursor=10), CFG, T0, N)["state"]
@@ -120,6 +134,18 @@ open(mock, "w").write('#!/bin/sh\necho "unauthorized" >&2\nexit 3\n'); os.chmod(
 p = subprocess.run([sys.executable, os.path.join(HERE, "dispatcher.py")], input=json.dumps(stop(sid="S")),
                    capture_output=True, text=True, env={**os.environ, "SPIKE_STATE_DIR": "/tmp", "SPIKE_TRACE_PATH": "/tmp/_t2.jsonl", "SPIKE_PARTY_BIN": mock})
 ok(p.stdout.strip() == "{}" and "RELEASE" in p.stderr, "party 401 → 立即放行+响亮(端到端)")
+# poll_ap 不合成 delivery_id（#1744.3）：history 消息无 delivery_id → RELEASE、不 claim（端到端）
+import tempfile  # noqa: E402
+sd = tempfile.mkdtemp()
+mock2 = os.path.join(HERE, "_mock_party_nodid.sh")
+open(mock2, "w").write('#!/bin/sh\ncat <<\'EOF\'\n{"seq":701,"kind":"message","sender":{"name":"x"},"mentions":["Evan_Clauder"],"body":"hi"}\nEOF\n')
+os.chmod(mock2, 0o755)
+p = subprocess.run([sys.executable, os.path.join(HERE, "dispatcher.py")], input=json.dumps(stop(sid="S")),
+                   capture_output=True, text=True,
+                   env={**os.environ, "SPIKE_STATE_DIR": sd, "SPIKE_TRACE_PATH": os.path.join(sd, "t.jsonl"), "SPIKE_PARTY_BIN": mock2, "SPIKE_SELF_NAME": "Evan_Clauder"})
+persisted = json.load(open(os.path.join(sd, "spike-state.json")))
+ok(p.stdout.strip() == "{}" and persisted.get("pending") is None and "no valid delivery_id" in p.stderr,
+   "history 消息无 delivery_id → RELEASE、不 claim（无合成，硬门槛真触发）")
 
 print(f"\n=== {_n['pass']} passed, {_n['fail']} failed ===")
 sys.exit(1 if _n["fail"] else 0)
